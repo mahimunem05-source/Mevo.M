@@ -243,12 +243,6 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
    * callbacks recognize they're stale (a race from rapid next/prev clicks)
    * and avoid clobbering newer state. */
   const loadTokenRef = useRef(0);
-  /** Consecutive load/playback failures for the *current* song, used to cap
-   * auto-skip retries so a broken queue can't spin forever. */
-  const errorRetryRef = useRef<{ songId: string | null; count: number }>({
-    songId: null,
-    count: 0,
-  });
   /**
    * Songs already served by "Next" (or auto-advance) during the current
    * shuffle cycle. Only meaningful while `shuffle` is on — reset whenever
@@ -262,7 +256,6 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
   const lastTimeEventRef = useRef(0);
   const lastPositionSaveRef = useRef(0);
   const fadeInStartRef = useRef<{ time: number; duration: number } | null>(null);
-  const gaplessPreloaderRef = useRef<HTMLAudioElement | null>(null);
 
   // Web Audio API refs for volume normalization
   const audioCtxRef = useRef<AudioContext | null>(null);
@@ -443,33 +436,36 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       }
 
       if (!sourceNodeRef.current && audioRef.current) {
-        audioRef.current.crossOrigin = "anonymous";
-        const source = ctx.createMediaElementSource(audioRef.current);
-        const compressor = ctx.createDynamicsCompressor();
-        const gain = ctx.createGain();
+        try {
+          const source = ctx.createMediaElementSource(audioRef.current);
+          const compressor = ctx.createDynamicsCompressor();
+          const gain = ctx.createGain();
 
-        // Standard broadcast/streaming dynamics compressor curve
-        compressor.threshold.setValueAtTime(
-          settings.volumeNormalization ? -24 : 0,
-          ctx.currentTime,
-        );
-        compressor.knee.setValueAtTime(30, ctx.currentTime);
-        compressor.ratio.setValueAtTime(settings.volumeNormalization ? 12 : 1, ctx.currentTime);
-        compressor.attack.setValueAtTime(0.003, ctx.currentTime);
-        compressor.release.setValueAtTime(0.25, ctx.currentTime);
+          // Standard broadcast/streaming dynamics compressor curve
+          compressor.threshold.setValueAtTime(
+            settings.volumeNormalization ? -24 : 0,
+            ctx.currentTime,
+          );
+          compressor.knee.setValueAtTime(30, ctx.currentTime);
+          compressor.ratio.setValueAtTime(settings.volumeNormalization ? 12 : 1, ctx.currentTime);
+          compressor.attack.setValueAtTime(0.003, ctx.currentTime);
+          compressor.release.setValueAtTime(0.25, ctx.currentTime);
 
-        gain.gain.setValueAtTime(settings.volumeNormalization ? 1.25 : 1.0, ctx.currentTime);
+          gain.gain.setValueAtTime(settings.volumeNormalization ? 1.25 : 1.0, ctx.currentTime);
 
-        source.connect(compressor);
-        compressor.connect(gain);
-        gain.connect(ctx.destination);
+          source.connect(compressor);
+          compressor.connect(gain);
+          gain.connect(ctx.destination);
 
-        sourceNodeRef.current = source;
-        compressorRef.current = compressor;
-        makeupGainRef.current = gain;
+          sourceNodeRef.current = source;
+          compressorRef.current = compressor;
+          makeupGainRef.current = gain;
 
-        // Initialize real-time multi-band equalizer filters & analysers
-        registerMultiBandAudioSource(ctx, source);
+          // Initialize real-time multi-band equalizer filters & analysers
+          registerMultiBandAudioSource(ctx, source);
+        } catch (nodeErr) {
+          console.warn("Web Audio media node connection bypassed:", nodeErr);
+        }
       }
     } catch (err) {
       console.warn("Web Audio volume normalization initialization bypassed:", err);
@@ -538,26 +534,12 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     updateAudioVolume();
   }, [volume, muted, updateAudioVolume]);
 
-  // Built-in Gapless playback buffer preloading for upcoming queue tracks
+  // Configure single global audio preload
   useEffect(() => {
-    if (typeof window === "undefined") return;
-
     if (audioRef.current) {
-      audioRef.current.preload = "auto";
+      audioRef.current.preload = settings.gaplessPlayback ? "auto" : "metadata";
     }
-
-    const nextIndex = session.currentIndex + 1;
-    const nextTrack = session.queue[nextIndex];
-
-    if (nextTrack && nextTrack.audio) {
-      if (!gaplessPreloaderRef.current) {
-        gaplessPreloaderRef.current = new Audio();
-      }
-      gaplessPreloaderRef.current.preload = "auto";
-      gaplessPreloaderRef.current.src = nextTrack.audio;
-      gaplessPreloaderRef.current.load();
-    }
-  }, [session.queue, session.currentIndex]);
+  }, [settings.gaplessPlayback]);
 
   const activateSong = useCallback(
     (song: Song, previousSong?: Song | null) => {
@@ -577,7 +559,6 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       setPlaying(true);
       setProgress(0);
       setPlaybackError(null);
-      errorRetryRef.current = { songId: null, count: 0 };
       if (audioRef.current && audioRef.current.dataset.songId !== song.id) {
         audioRef.current.currentTime = 0;
       }
@@ -1043,40 +1024,48 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     const element = audioRef.current;
-    if (element) {
-      if (!current) {
-        element.pause();
-        element.removeAttribute("src");
-        delete element.dataset.songId;
-        element.load();
-        setProgress(0);
-      } else {
-        const isNewSong = element.dataset.songId !== current.id;
-        if (isNewSong) {
-          element.dataset.songId = current.id;
-          element.pause();
-          element.src = current.audio;
-          element.currentTime = 0;
-          setProgress(0);
-          element.load();
-        }
+    if (!element) return;
 
-        const token = ++loadTokenRef.current;
-        if (isPlaying) {
-          initAudioContext();
-          const playPromise = element.play();
-          if (playPromise !== undefined) {
-            playPromise.catch((error) => {
-              if (loadTokenRef.current !== token) return;
-              if (error.name === "AbortError") return;
-              console.error("Playback failed:", error);
-              setPlaying(false);
-            });
-          }
-        } else {
-          element.pause();
-        }
+    if (!current) {
+      element.pause();
+      element.removeAttribute("src");
+      delete element.dataset.songId;
+      element.load();
+      setProgress(0);
+      return;
+    }
+
+    if (!current.audio) {
+      element.pause();
+      setPlaying(false);
+      setPlaybackError(`No audio source available for "${current.title}".`);
+      return;
+    }
+
+    const isNewSong = element.dataset.songId !== current.id;
+    if (isNewSong) {
+      element.dataset.songId = current.id;
+      element.pause();
+      element.src = current.audio;
+      element.currentTime = 0;
+      setProgress(0);
+      element.load();
+    }
+
+    const token = ++loadTokenRef.current;
+    if (isPlaying) {
+      initAudioContext();
+      const playPromise = element.play();
+      if (playPromise !== undefined) {
+        playPromise.catch((error) => {
+          if (loadTokenRef.current !== token) return;
+          if (error.name === "AbortError") return;
+          console.warn("Playback failed or was interrupted:", error);
+          setPlaying(false);
+        });
       }
+    } else {
+      element.pause();
     }
 
     // Sync MediaSession API metadata for Android notification & lock screen media controls
@@ -1260,9 +1249,8 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
   );
 
   /**
-   * Seamless song switching — prefetch the neighbouring tracks in the queue
-   * (artwork + audio metadata) so that skipping shows the next cover and
-   * metadata instantly instead of flashing an empty player.
+   * Prefetch the neighbouring cover artwork so that switching tracks
+   * displays the next cover immediately without network lag.
    */
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -1271,26 +1259,13 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       session.queue[session.currentIndex - 1],
     ].filter(Boolean) as Song[];
 
-    const audios: HTMLAudioElement[] = [];
     for (const song of neighbours) {
-      if (song.cover) {
+      if (song.cover && !song.cover.startsWith("data:")) {
         const img = new Image();
         img.decoding = "async";
         img.src = song.cover;
       }
-      if (song.audio) {
-        const audio = new Audio();
-        audio.preload = "metadata";
-        audio.src = song.audio;
-        audios.push(audio);
-      }
     }
-
-    return () => {
-      for (const audio of audios) {
-        audio.src = "";
-      }
-    };
   }, [session.queue, session.currentIndex]);
 
   const progressValue: PlayerProgressState = useMemo(
@@ -1333,29 +1308,28 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
           onError={() => {
             const failedSong = current;
             setIsBuffering(false);
-            const retry = errorRetryRef.current;
-            const count = retry.songId === failedSong?.id ? retry.count + 1 : 1;
-            errorRetryRef.current = { songId: failedSong?.id ?? null, count };
+            setPlaying(false);
 
-            const message = `Couldn't play "${failedSong?.title ?? "this track"}".`;
-            // Cap retries per track at 2 so a genuinely broken file (or a run
-            // of broken files) can't spin the player forever — after that we
-            // stop and surface the error instead of silently looping.
-            const recoverable = count <= 2 && session.queue.length > 1;
+            const message = failedSong?.title
+              ? `Couldn't play "${failedSong.title}". Please check audio source or try another track.`
+              : "Audio source is currently unavailable.";
+            
             setPlaybackError(message);
             playbackEvents.emit("ERROR", {
               message,
               songId: failedSong?.id ?? null,
-              recoverable,
+              recoverable: false,
             });
-            if (recoverable) {
-              step(1, true);
-            } else {
-              setPlaying(false);
-            }
+            // CRITICAL: Stop automatic next-track skips on audio error to prevent rapid-switching loops
           }}
           onEnded={() => {
             const endedSong = current;
+            const audioEl = audioRef.current;
+            // Guard: ensure track legitimately finished playback and was not aborted or 0-length
+            if (!audioEl || !endedSong || audioEl.currentTime <= 0) {
+              return;
+            }
+
             if (endedSong) {
               const shouldLogActivity = settings.showListeningActivity && !settings.privateSession;
               if (shouldLogActivity) {
@@ -1363,16 +1337,16 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
                 recordSongPlayedTimestamp(endedSong.id);
               }
             }
-            if (repeat === "one" && audioRef.current) {
-              audioRef.current.currentTime = 0;
+            if (repeat === "one") {
+              audioEl.currentTime = 0;
               if (settings.crossfadeSeconds > 0) {
                 fadeInStartRef.current = {
                   time: performance.now(),
                   duration: settings.crossfadeSeconds * 1000,
                 };
-                audioRef.current.volume = 0;
+                audioEl.volume = 0;
               }
-              void audioRef.current.play();
+              void audioEl.play().catch(() => setPlaying(false));
             } else {
               step(1, true);
             }

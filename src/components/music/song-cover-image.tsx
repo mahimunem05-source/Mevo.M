@@ -35,23 +35,10 @@ function SongCoverImageComponent({
   }, [src, fallbackSrc]);
 
   const handleError = (e: React.SyntheticEvent<HTMLImageElement, Event>) => {
-    const originalSrc = src?.trim();
-
-    // If we have a remote URL that hasn't been retried yet, attempt safe 1-time retry
-    if (!retriedRef.current && originalSrc && originalSrc.startsWith("http") && originalSrc !== fallbackSrc) {
-      retriedRef.current = true;
-      // Retry once after a brief tick
-      setTimeout(() => {
-        setImgSrc(originalSrc);
-      }, 300);
-      return;
-    }
-
-    // Otherwise gracefully fall back to default cover placeholder
+    // Gracefully fall back to default cover placeholder immediately
     if (imgSrc !== fallbackSrc) {
       setImgSrc(fallbackSrc);
     }
-
     onError?.(e);
   };
 
