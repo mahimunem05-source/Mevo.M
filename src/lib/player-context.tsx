@@ -9,7 +9,6 @@ import {
   type ReactNode,
 } from "react";
 import {
-  sections,
   songs as staticSongs,
   isSongExplicit,
   type NavigationSource,
@@ -18,15 +17,12 @@ import {
 } from "@/data/songs";
 import { getSongs, incrementPlayCount } from "@/services/songService";
 import { recordPlay, recordSongPlayedTimestamp } from "@/services/listeningHistoryService";
-import { supabase } from "@/lib/supabase";
 import { subscribeToRealtimeChanges } from "@/lib/realtime-helper";
 import { databaseSongToPlayerSong, mergePlayerSongs } from "@/lib/song-adapter";
-import { shuffleArray } from "@/lib/collection-utils";
 import { playbackEvents } from "@/lib/playback-events";
 import { startEngagementTracking } from "@/lib/ranking/engagement-tracker";
 import { createUniversalSmartQueue, generateDiscoveryQueue } from "@/lib/ranking/queue-engine";
 import { useSettings } from "@/context/SettingsContext";
-import { registerMultiBandAudioSource } from "@/lib/multi-band-audio";
 
 type RepeatMode = "off" | "all" | "one";
 
@@ -110,11 +106,9 @@ const PlayerContext = createContext<PlayerState | null>(null);
 
 /**
  * currentTime/duration change up to 4x/sec during playback. They're kept
- * out of PlayerState and in their own context so that a future progress
- * display (e.g. a seek bar) can subscribe without forcing every other
- * usePlayer() consumer across the app (song cards, lists, navbar, etc.)
- * to re-render on every tick — that churn was the cause of the app-wide
- * jank/flash feeling during playback.
+ * out of PlayerState and in their own context so that progress bars
+ * (e.g. SeekBar) subscribe without forcing every other usePlayer() consumer
+ * across the app to re-render on every tick.
  */
 interface PlayerProgressState {
   progress: number;
@@ -124,6 +118,7 @@ const PlayerProgressContext = createContext<PlayerProgressState>({
   progress: 0,
   duration: 0,
 });
+
 const LIKES_KEY = "mahi-music:likes";
 const PLAYER_STORAGE_KEY = "mahi-music-playback-session-v3";
 const PLAYER_DISMISSED_KEY = "mahi-music:player-dismissed";
@@ -224,7 +219,10 @@ function dedupeSongs(songs: Song[]): Song[] {
 
 export function PlayerProvider({ children }: { children: ReactNode }) {
   const { settings, updateSetting } = useSettings();
+
+  // 1. Single Dedicated HTMLAudioElement Reference
   const audioRef = useRef<HTMLAudioElement | null>(null);
+
   const [catalogue, setCatalogue] = useState<Song[]>([...staticSongs]);
   const [session, setSession] = useState<PlaybackSession>(EMPTY_SESSION);
   const [isPlaying, setPlaying] = useState(false);
@@ -238,37 +236,13 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
   const [recent, setRecent] = useState<Song[]>([]);
   const [isBuffering, setIsBuffering] = useState(false);
   const [playbackError, setPlaybackError] = useState<string | null>(null);
+
   const pendingRestoreRef = useRef<StoredPlaybackSession | null>(null);
-  /** Bumped every time a new song is asked to load — lets async audio.play()
-   * callbacks recognize they're stale (a race from rapid next/prev clicks)
-   * and avoid clobbering newer state. */
   const loadTokenRef = useRef(0);
-  /**
-   * Songs already served by "Next" (or auto-advance) during the current
-   * shuffle cycle. Only meaningful while `shuffle` is on — reset whenever
-   * shuffle is turned on and whenever a cycle completes (every other song
-   * in the queue has been played), so random selection always has a full
-   * pool to draw from again rather than drying up.
-   */
   const shufflePlayedIdsRef = useRef<Set<string>>(new Set());
-  /** Throttles TIME_UPDATE emissions to a few times a second regardless of
-   * how often the browser fires `timeupdate`. */
   const lastTimeEventRef = useRef(0);
-  const lastPositionSaveRef = useRef(0);
-  const fadeInStartRef = useRef<{ time: number; duration: number } | null>(null);
 
-  // Web Audio API refs for volume normalization
-  const audioCtxRef = useRef<AudioContext | null>(null);
-  const sourceNodeRef = useRef<MediaElementAudioSourceNode | null>(null);
-  const compressorRef = useRef<DynamicsCompressorNode | null>(null);
-  const makeupGainRef = useRef<GainNode | null>(null);
-
-  /**
-   * Bottom player visibility.
-   * - First ever visit: hidden until a song is played.
-   * - Returning visit with a stored session: restored automatically…
-   * - …unless the user dismissed it with the ✕ button last time.
-   */
+  // Bottom player visibility
   const [playerVisible, setPlayerVisible] = useState(false);
 
   const autoplayEnabled = settings.autoplay;
@@ -280,12 +254,10 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
 
   const current = session.currentIndex >= 0 ? (session.queue[session.currentIndex] ?? null) : null;
 
-  /**
-   * Anonymous engagement tracking for the ranking system. It only listens to
-   * the playback event bus — it never influences playback itself.
-   */
+  // Anonymous engagement tracking
   useEffect(() => startEngagementTracking(), []);
 
+  // Restore stored session on mount
   useEffect(() => {
     pendingRestoreRef.current = readStoredSession();
     const stored = pendingRestoreRef.current;
@@ -302,11 +274,6 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     }
     if (stored && !dismissed) setPlayerVisible(true);
     setLikes(readStoredLikes());
-    try {
-      window.localStorage.removeItem("mevo-playback-positions");
-    } catch {
-      /* ignore */
-    }
   }, []);
 
   const hidePlayer = useCallback(() => {
@@ -314,10 +281,11 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     try {
       window.localStorage.setItem(PLAYER_DISMISSED_KEY, "1");
     } catch {
-      /* storage unavailable — visibility still updates for this session */
+      /* ignore */
     }
   }, []);
 
+  // Fetch / Sync Catalogue
   useEffect(() => {
     let isMounted = true;
 
@@ -394,6 +362,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     };
   }, []);
 
+  // Persist playback session to localStorage
   useEffect(() => {
     try {
       if (session.queue.length === 0) {
@@ -418,128 +387,36 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     }
   }, [session, current?.id, shuffle, repeat, volume, autoplayEnabled]);
 
-  // Initialize Web Audio API compressor & gain node for volume normalization
-  const initAudioContext = useCallback(() => {
-    if (typeof window === "undefined") return;
+  // Synchronize volume & mute state directly to the single audio element
+  useEffect(() => {
+    const audio = audioRef.current;
+    if (!audio) return;
+    const targetVolume = muted ? 0 : Math.max(0, Math.min(1, volume));
+    audio.volume = targetVolume;
+    audio.muted = muted;
+  }, [volume, muted]);
+
+  // Safe playback trigger
+  const executePlay = useCallback(async () => {
+    const audio = audioRef.current;
+    if (!audio) return;
+
+    // Explicitly verify audio volume & mute state prior to play
+    audio.muted = muted;
+    audio.volume = muted ? 0 : Math.max(0, Math.min(1, volume));
+
     try {
-      const AudioCtx =
-        window.AudioContext ||
-        (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-      if (!AudioCtx) return;
-
-      if (!audioCtxRef.current) {
-        audioCtxRef.current = new AudioCtx();
+      await audio.play();
+    } catch (error: unknown) {
+      const err = error as { name?: string; message?: string };
+      if (err.name === "AbortError") {
+        // Normal when user skips quickly between tracks; safely ignore
+        return;
       }
-      const ctx = audioCtxRef.current;
-      if (ctx.state === "suspended") {
-        void ctx.resume();
-      }
-
-      if (!sourceNodeRef.current && audioRef.current) {
-        try {
-          const source = ctx.createMediaElementSource(audioRef.current);
-          const compressor = ctx.createDynamicsCompressor();
-          const gain = ctx.createGain();
-
-          // Standard broadcast/streaming dynamics compressor curve
-          compressor.threshold.setValueAtTime(
-            settings.volumeNormalization ? -24 : 0,
-            ctx.currentTime,
-          );
-          compressor.knee.setValueAtTime(30, ctx.currentTime);
-          compressor.ratio.setValueAtTime(settings.volumeNormalization ? 12 : 1, ctx.currentTime);
-          compressor.attack.setValueAtTime(0.003, ctx.currentTime);
-          compressor.release.setValueAtTime(0.25, ctx.currentTime);
-
-          gain.gain.setValueAtTime(settings.volumeNormalization ? 1.25 : 1.0, ctx.currentTime);
-
-          source.connect(compressor);
-          compressor.connect(gain);
-          gain.connect(ctx.destination);
-
-          sourceNodeRef.current = source;
-          compressorRef.current = compressor;
-          makeupGainRef.current = gain;
-
-          // Initialize real-time multi-band equalizer filters & analysers
-          registerMultiBandAudioSource(ctx, source);
-        } catch (nodeErr) {
-          console.warn("Web Audio media node connection bypassed:", nodeErr);
-        }
-      }
-    } catch (err) {
-      console.warn("Web Audio volume normalization initialization bypassed:", err);
+      console.warn("[Mahi Music Audio] Playback execution notice:", error);
+      setPlaying(false);
     }
-  }, [settings.volumeNormalization]);
-
-  // Dynamically update normalization parameters when setting toggles
-  useEffect(() => {
-    if (compressorRef.current && makeupGainRef.current && audioCtxRef.current) {
-      const ctx = audioCtxRef.current;
-      const now = ctx.currentTime;
-      if (settings.volumeNormalization) {
-        compressorRef.current.threshold.setTargetAtTime(-24, now, 0.08);
-        compressorRef.current.ratio.setTargetAtTime(12, now, 0.08);
-        makeupGainRef.current.gain.setTargetAtTime(1.25, now, 0.08);
-      } else {
-        compressorRef.current.threshold.setTargetAtTime(0, now, 0.08);
-        compressorRef.current.ratio.setTargetAtTime(1, now, 0.08);
-        makeupGainRef.current.gain.setTargetAtTime(1.0, now, 0.08);
-      }
-    }
-  }, [settings.volumeNormalization]);
-
-  // Controls real audio element volume accounting for mute, user volume, and crossfade fades
-  const updateAudioVolume = useCallback(() => {
-    const element = audioRef.current;
-    if (!element) return;
-    const targetVolume = muted ? 0 : volume;
-
-    if (settings.crossfadeSeconds <= 0 || !isPlaying) {
-      element.volume = targetVolume;
-      return;
-    }
-
-    // 1. Fade-in factor when new song started
-    let fadeInFactor = 1;
-    if (fadeInStartRef.current) {
-      const elapsed = performance.now() - fadeInStartRef.current.time;
-      const durationMs = fadeInStartRef.current.duration;
-      if (durationMs > 0 && elapsed < durationMs) {
-        fadeInFactor = Math.min(1, Math.max(0, elapsed / durationMs));
-      } else {
-        fadeInStartRef.current = null;
-      }
-    }
-
-    // 2. Fade-out factor when approaching track end
-    let fadeOutFactor = 1;
-    const curTime = element.currentTime;
-    const totalDuration = element.duration || duration;
-    if (totalDuration > settings.crossfadeSeconds && curTime > 0) {
-      const remaining = totalDuration - curTime;
-      if (remaining <= settings.crossfadeSeconds && remaining >= 0) {
-        fadeOutFactor = Math.min(1, Math.max(0, remaining / settings.crossfadeSeconds));
-      }
-    }
-
-    const effectiveFactor = Math.min(fadeInFactor, fadeOutFactor);
-    const effectiveVolume = Math.min(1, Math.max(0, targetVolume * effectiveFactor));
-    if (Number.isFinite(effectiveVolume)) {
-      element.volume = effectiveVolume;
-    }
-  }, [muted, volume, settings.crossfadeSeconds, isPlaying, duration]);
-
-  useEffect(() => {
-    updateAudioVolume();
-  }, [volume, muted, updateAudioVolume]);
-
-  // Configure single global audio preload
-  useEffect(() => {
-    if (audioRef.current) {
-      audioRef.current.preload = settings.gaplessPlayback ? "auto" : "metadata";
-    }
-  }, [settings.gaplessPlayback]);
+  }, [muted, volume]);
 
   const activateSong = useCallback(
     (song: Song, previousSong?: Song | null) => {
@@ -559,35 +436,15 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       setPlaying(true);
       setProgress(0);
       setPlaybackError(null);
-      if (audioRef.current && audioRef.current.dataset.songId !== song.id) {
-        audioRef.current.currentTime = 0;
-      }
-
-      // Initialize crossfade fade-in if crossfade is enabled
-      if (settings.crossfadeSeconds > 0) {
-        fadeInStartRef.current = {
-          time: performance.now(),
-          duration: settings.crossfadeSeconds * 1000,
-        };
-        if (audioRef.current) {
-          audioRef.current.volume = 0;
-        }
-      } else {
-        fadeInStartRef.current = null;
-        if (audioRef.current) {
-          audioRef.current.volume = muted ? 0 : volume;
-        }
-      }
-
-      // Playing a song always reveals the bottom player and clears a previous dismiss.
       setPlayerVisible(true);
+
       try {
         window.localStorage.removeItem(PLAYER_DISMISSED_KEY);
       } catch {
         /* ignore */
       }
 
-      // Log listening activity only if enabled and not in a private session
+      // Log listening activity
       const shouldLogActivity = settings.showListeningActivity && !settings.privateSession;
       if (shouldLogActivity) {
         setRecent((previous) =>
@@ -605,14 +462,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       playbackEvents.emit("SONG_CHANGE", { song, previous: previousSong ?? null });
       playbackEvents.emit("PLAY", { song });
     },
-    [
-      muted,
-      volume,
-      settings.crossfadeSeconds,
-      settings.allowExplicitContent,
-      settings.showListeningActivity,
-      settings.privateSession,
-    ],
+    [settings.allowExplicitContent, settings.showListeningActivity, settings.privateSession],
   );
 
   const playFromCollection = useCallback(
@@ -625,7 +475,6 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       if (!songsList || songsList.length === 0) return;
       const selectedSong = songsList[selectedIndex] ?? songsList[0];
 
-      // Dynamically rank the remaining songs of this active section with the universal 4-factor scoring engine
       const smartQueue = createUniversalSmartQueue({
         currentTrack: selectedSong,
         contextSongs: songsList,
@@ -750,8 +599,6 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     [catalogue],
   );
 
-  /** Insert a song immediately after the current track — "Play Next". If it's
-   * already elsewhere in the queue it's moved, not duplicated. */
   const playNext = useCallback((song: Song) => {
     setSession((previous) => {
       if (previous.currentIndex < 0) return previous;
@@ -770,7 +617,6 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     });
   }, []);
 
-  /** Append a song to the end of the queue — "Add to Queue". */
   const addToQueue = useCallback((song: Song) => {
     setSession((previous) => {
       if (previous.queue.some((item) => item.id === song.id)) return previous;
@@ -785,10 +631,6 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     });
   }, []);
 
-  /** Remove a track from the queue by position. If it was the currently
-   * playing track, playback advances to what is now at that index (mirrors
-   * Spotify: removing the now-playing song skips to the next one without
-   * stopping playback), or stops cleanly if the queue is now empty. */
   const removeFromQueue = useCallback(
     (index: number) => {
       setSession((previous) => {
@@ -808,7 +650,6 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
         if (index < previous.currentIndex) {
           return { ...previous, queue, originalQueue, currentIndex: previous.currentIndex - 1 };
         }
-        // The now-playing track was removed.
         if (queue.length === 0) {
           setPlaying(false);
           return { ...previous, queue, originalQueue, currentIndex: -1 };
@@ -821,9 +662,6 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     [activateSong],
   );
 
-  /** Move a queued track from one position to another — drag-to-reorder in
-   * Up Next. Keeps `currentIndex` pointing at whichever song is actually
-   * playing, even when that song itself is the one being moved. */
   const reorderQueue = useCallback((fromIndex: number, toIndex: number) => {
     setSession((previous) => {
       if (
@@ -851,7 +689,6 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     });
   }, []);
 
-  /** Clear the queue down to just the currently playing track. */
   const clearQueue = useCallback(() => {
     setSession((previous) => {
       const currentSong = previous.queue[previous.currentIndex];
@@ -867,13 +704,9 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
         if (previous.queue.length === 0 || previous.currentIndex < 0) return previous;
         const currentSong = previous.queue[previous.currentIndex];
 
-        // --- Shuffle ON: random-unplayed Next, history-based Previous. ---
-        // The visible queue order (`previous.queue`) is never touched here —
-        // only which song becomes current, and where playback history points.
+        // Shuffle Mode Handling
         if (shuffle && currentSong) {
           if (direction === -1) {
-            // Previous always retraces actual playback history, never a new
-            // random pick — going "back" should be deterministic.
             if (previous.history.length === 0) return previous;
             const previousId = previous.history[previous.history.length - 1];
             const previousSong =
@@ -892,9 +725,6 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
             };
           }
 
-          // direction === 1: pick a random song not currently playing and not
-          // yet played this shuffle cycle; once every other song has had a
-          // turn, start a fresh cycle rather than refusing to advance.
           let pool = previous.queue.filter(
             (song) => song.id !== currentSong.id && !shufflePlayedIdsRef.current.has(song.id),
           );
@@ -922,7 +752,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
           };
         }
 
-        // --- Shuffle OFF: original sequential-order behavior, unchanged. ---
+        // Sequential Mode Handling
         const atEnd = previous.currentIndex === previous.queue.length - 1;
         const atStart = previous.currentIndex === 0;
 
@@ -933,10 +763,13 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
             return previous;
           }
 
-          // Cross-Section Discovery: Automatically append matching discovery songs from
-          // other sections / global library (matching current song's genre/language/category/artist)
-          const current = previous.queue[previous.currentIndex];
-          const discoveryTracks = generateDiscoveryQueue(current, previous.queue, catalogue, 20);
+          const currentTrack = previous.queue[previous.currentIndex];
+          const discoveryTracks = generateDiscoveryQueue(
+            currentTrack,
+            previous.queue,
+            catalogue,
+            20,
+          );
 
           if (discoveryTracks.length === 0) {
             setPlaying(false);
@@ -947,7 +780,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
           const queue = [...previous.queue, ...discoveryTracks];
           const nextIndex = previous.currentIndex + 1;
           const song = queue[nextIndex];
-          activateSong(song, current);
+          activateSong(song, currentTrack);
           playbackEvents.emit("QUEUE_ENDED", { autoplayed: true });
           playbackEvents.emit("QUEUE_CHANGE", {
             queue,
@@ -959,7 +792,9 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
             ...previous,
             queue,
             currentIndex: nextIndex,
-            history: current ? [...previous.history, current.id].slice(-100) : previous.history,
+            history: currentTrack
+              ? [...previous.history, currentTrack.id].slice(-100)
+              : previous.history,
           };
         }
 
@@ -983,7 +818,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
         };
       });
     },
-    [activateSong, catalogue, repeat, autoplayEnabled, recent, shuffle],
+    [activateSong, catalogue, repeat, autoplayEnabled, shuffle],
   );
 
   const next = useCallback(() => step(1, false), [step]);
@@ -996,79 +831,62 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       return;
     }
     setPlaying((value) => {
-      const next = !value;
-      playbackEvents.emit(next ? "PLAY" : "PAUSE", next ? { song: current } : { song: current });
-      return next;
+      const nextState = !value;
+      playbackEvents.emit(
+        nextState ? "PLAY" : "PAUSE",
+        nextState ? { song: current } : { song: current },
+      );
+      return nextState;
     });
   }, [catalogue, current, play]);
 
-  /**
-   * Shuffle is a pure toggle: it only flips the flag that `step()` reads.
-   * It never touches the current song or the visible queue order — the
-   * bug this replaces reordered `session.queue` (and therefore the
-   * visible Up Next list) the instant shuffle was turned on, and jumped
-   * to a new song immediately. Whichever song is already playing keeps
-   * playing; the next actual song change (Next / auto-advance / manual
-   * Up Next pick) is what decides where playback goes from here.
-   */
   const toggleShuffle = useCallback(() => {
     setShuffle((enabled) => {
       const nextEnabled = !enabled;
-      // Starting a shuffle session begins a fresh cycle so every song in
-      // the queue is eligible again.
       shufflePlayedIdsRef.current = new Set();
       playbackEvents.emit("SHUFFLE", { enabled: nextEnabled });
       return nextEnabled;
     });
   }, []);
 
+  // Synchronize Audio Track Source & Playback State
   useEffect(() => {
-    const element = audioRef.current;
-    if (!element) return;
+    const audio = audioRef.current;
+    if (!audio) return;
 
     if (!current) {
-      element.pause();
-      element.removeAttribute("src");
-      delete element.dataset.songId;
-      element.load();
+      audio.pause();
+      audio.removeAttribute("src");
+      delete audio.dataset.songId;
+      audio.load();
       setProgress(0);
       return;
     }
 
     if (!current.audio) {
-      element.pause();
+      audio.pause();
       setPlaying(false);
       setPlaybackError(`No audio source available for "${current.title}".`);
       return;
     }
 
-    const isNewSong = element.dataset.songId !== current.id;
-    if (isNewSong) {
-      element.dataset.songId = current.id;
-      element.pause();
-      element.src = current.audio;
-      element.currentTime = 0;
+    const isNewTrack = audio.dataset.songId !== current.id;
+    if (isNewTrack) {
+      audio.dataset.songId = current.id;
+      audio.pause();
+      audio.src = current.audio;
+      audio.currentTime = 0;
       setProgress(0);
-      element.load();
+      audio.load();
     }
 
-    const token = ++loadTokenRef.current;
     if (isPlaying) {
-      initAudioContext();
-      const playPromise = element.play();
-      if (playPromise !== undefined) {
-        playPromise.catch((error) => {
-          if (loadTokenRef.current !== token) return;
-          if (error.name === "AbortError") return;
-          console.warn("Playback failed or was interrupted:", error);
-          setPlaying(false);
-        });
-      }
+      void executePlay();
     } else {
-      element.pause();
+      audio.pause();
     }
 
-    // Sync MediaSession API metadata for Android notification & lock screen media controls
+    // MediaSession API Sync for lock-screen & mobile media controls
     if (typeof window !== "undefined" && "mediaSession" in navigator) {
       if (current) {
         try {
@@ -1087,22 +905,25 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
           });
           navigator.mediaSession.playbackState = isPlaying ? "playing" : "paused";
         } catch {
-          // Ignore browser MediaSession metadata assignment errors
+          // Ignore unsupported MediaSession attributes
         }
       } else {
         navigator.mediaSession.metadata = null;
         navigator.mediaSession.playbackState = "none";
       }
     }
-  }, [current, isPlaying, initAudioContext]);
+  }, [current, isPlaying, executePlay]);
 
   const seek = useCallback((seconds: number) => {
-    if (audioRef.current) audioRef.current.currentTime = seconds;
+    const audio = audioRef.current;
+    if (audio && Number.isFinite(seconds)) {
+      audio.currentTime = seconds;
+    }
     setProgress(seconds);
     playbackEvents.emit("SEEK", { seconds });
   }, []);
 
-  // Hook MediaSession Action Handlers (Play, Pause, Previous, Next, SeekTo)
+  // Hook MediaSession Action Handlers
   useEffect(() => {
     if (typeof window === "undefined" || !("mediaSession" in navigator)) return;
 
@@ -1125,23 +946,34 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       try {
         navigator.mediaSession.setActionHandler(action, handler);
       } catch {
-        // Ignore unsupported media session actions
+        // Ignore unsupported actions
       }
     }
+
+    return () => {
+      for (const [action] of actionHandlers) {
+        try {
+          navigator.mediaSession.setActionHandler(action, null);
+        } catch {
+          // Ignore cleanup errors
+        }
+      }
+    };
   }, [next, previous, seek]);
 
   const setVolume = useCallback((nextVolume: number) => {
-    setVolumeState(nextVolume);
-    if (nextVolume > 0) setMuted(false);
+    const clamped = Math.max(0, Math.min(1, nextVolume));
+    setVolumeState(clamped);
+    if (clamped > 0) setMuted(false);
   }, []);
 
   const toggleMute = useCallback(() => setMuted((value) => !value), []);
 
   const cycleRepeat = useCallback(() => {
     setRepeat((value) => {
-      const next = value === "off" ? "all" : value === "all" ? "one" : "off";
-      playbackEvents.emit("REPEAT", { mode: next });
-      return next;
+      const nextMode = value === "off" ? "all" : value === "all" ? "one" : "off";
+      playbackEvents.emit("REPEAT", { mode: nextMode });
+      return nextMode;
     });
   }, []);
 
@@ -1159,11 +991,6 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
 
   const isLiked = useCallback((id: string) => likes.includes(id), [likes]);
 
-  // Memoized so the object reference only changes when one of these
-  // dependencies actually changes — critically, NOT on every progress
-  // tick (progress/duration live in PlayerProgressContext instead).
-  // This keeps every usePlayer() consumer across the app from
-  // re-rendering 4x/sec during playback.
   const value: PlayerState = useMemo(
     () => ({
       current,
@@ -1208,7 +1035,6 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       autoplayEnabled,
       toggleAutoplay,
     }),
-
     [
       current,
       catalogue,
@@ -1248,10 +1074,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     ],
   );
 
-  /**
-   * Prefetch the neighbouring cover artwork so that switching tracks
-   * displays the next cover immediately without network lag.
-   */
+  // Artwork Preloading for Next & Prev tracks
   useEffect(() => {
     if (typeof window === "undefined") return;
     const neighbours = [
@@ -1277,6 +1100,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     <PlayerContext.Provider value={value}>
       <PlayerProgressContext.Provider value={progressValue}>
         {children}
+        {/* Single Dedicated HTMLAudioElement instance rendered in React DOM tree */}
         <audio
           ref={audioRef}
           preload={settings.gaplessPlayback ? "auto" : "metadata"}
@@ -1284,7 +1108,6 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
             const currentTime = event.currentTarget.currentTime;
             const currentDuration = event.currentTarget.duration;
             setProgress(currentTime);
-            updateAudioVolume();
 
             const now = performance.now();
             if (now - lastTimeEventRef.current > 500) {
@@ -1294,7 +1117,16 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
           }}
           onLoadedMetadata={(event) => {
             const dur = event.currentTarget.duration;
-            setDuration(dur);
+            if (Number.isFinite(dur) && dur > 0) {
+              setDuration(dur);
+            }
+          }}
+          onPlay={() => {
+            setPlaying(true);
+            setIsBuffering(false);
+          }}
+          onPause={() => {
+            setPlaying(false);
           }}
           onWaiting={() => {
             setIsBuffering(true);
@@ -1304,7 +1136,9 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
             setIsBuffering(false);
             playbackEvents.emit("BUFFERING", { buffering: false });
           }}
-          onCanPlay={() => setIsBuffering(false)}
+          onCanPlay={() => {
+            setIsBuffering(false);
+          }}
           onError={() => {
             const failedSong = current;
             setIsBuffering(false);
@@ -1313,40 +1147,30 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
             const message = failedSong?.title
               ? `Couldn't play "${failedSong.title}". Please check audio source or try another track.`
               : "Audio source is currently unavailable.";
-            
+
             setPlaybackError(message);
             playbackEvents.emit("ERROR", {
               message,
               songId: failedSong?.id ?? null,
               recoverable: false,
             });
-            // CRITICAL: Stop automatic next-track skips on audio error to prevent rapid-switching loops
           }}
           onEnded={() => {
             const endedSong = current;
             const audioEl = audioRef.current;
-            // Guard: ensure track legitimately finished playback and was not aborted or 0-length
             if (!audioEl || !endedSong || audioEl.currentTime <= 0) {
               return;
             }
 
-            if (endedSong) {
-              const shouldLogActivity = settings.showListeningActivity && !settings.privateSession;
-              if (shouldLogActivity) {
-                void recordPlay(endedSong.id, duration || endedSong.duration, true);
-                recordSongPlayedTimestamp(endedSong.id);
-              }
+            const shouldLogActivity = settings.showListeningActivity && !settings.privateSession;
+            if (shouldLogActivity) {
+              void recordPlay(endedSong.id, duration || endedSong.duration, true);
+              recordSongPlayedTimestamp(endedSong.id);
             }
+
             if (repeat === "one") {
               audioEl.currentTime = 0;
-              if (settings.crossfadeSeconds > 0) {
-                fadeInStartRef.current = {
-                  time: performance.now(),
-                  duration: settings.crossfadeSeconds * 1000,
-                };
-                audioEl.volume = 0;
-              }
-              void audioEl.play().catch(() => setPlaying(false));
+              void executePlay();
             } else {
               step(1, true);
             }
