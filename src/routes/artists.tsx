@@ -10,6 +10,8 @@ import { subscribeToRealtimeChanges } from "@/lib/realtime-helper";
 import { groupSongsByArtist } from "@/lib/collection-utils";
 import type { Song } from "@/data/songs";
 import { SongCoverImage } from "@/components/music/song-cover-image";
+import { PageHeader } from "@/components/music/page-header";
+import { usePlayer } from "@/lib/player-context";
 
 export const Route = createFileRoute("/artists")({
   head: () => ({
