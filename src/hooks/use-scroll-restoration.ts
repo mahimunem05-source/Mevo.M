@@ -80,28 +80,45 @@ function getScrollContainers(): NodeListOf<HTMLElement> {
 // triggers it) also fires a "locationchange" event we can listen for —
 // mirroring what already happens natively for popstate.
 let historyPatched = false;
+
 function ensureHistoryPatched() {
-  if (historyPatched || typeof window === "undefined") return;
+  if (typeof window === "undefined" || !window.history || historyPatched) return;
   historyPatched = true;
 
-  const originalPushState = window.history.pushState.bind(window.history);
-  const originalReplaceState = window.history.replaceState.bind(window.history);
+  try {
+    const originalPushState = window.history.pushState
+      ? window.history.pushState.bind(window.history)
+      : null;
+    const originalReplaceState = window.history.replaceState
+      ? window.history.replaceState.bind(window.history)
+      : null;
 
-  window.history.pushState = function patchedPushState(
-    ...args: Parameters<typeof originalPushState>
-  ) {
-    const result = originalPushState(...args);
-    window.dispatchEvent(new Event("mahi:locationchange"));
-    return result;
-  } as typeof window.history.pushState;
+    if (originalPushState) {
+      window.history.pushState = function patchedPushState(
+        ...args: Parameters<typeof originalPushState>
+      ) {
+        const result = originalPushState(...args);
+        try {
+          window.dispatchEvent(new Event("mahi:locationchange"));
+        } catch {}
+        return result;
+      } as typeof window.history.pushState;
+    }
 
-  window.history.replaceState = function patchedReplaceState(
-    ...args: Parameters<typeof originalReplaceState>
-  ) {
-    const result = originalReplaceState(...args);
-    window.dispatchEvent(new Event("mahi:locationchange"));
-    return result;
-  } as typeof window.history.replaceState;
+    if (originalReplaceState) {
+      window.history.replaceState = function patchedReplaceState(
+        ...args: Parameters<typeof originalReplaceState>
+      ) {
+        const result = originalReplaceState(...args);
+        try {
+          window.dispatchEvent(new Event("mahi:locationchange"));
+        } catch {}
+        return result;
+      } as typeof window.history.replaceState;
+    }
+  } catch (err) {
+    console.warn("[MEVO] History state patching skipped:", err);
+  }
 }
 
 export function useScrollRestoration() {
@@ -111,7 +128,12 @@ export function useScrollRestoration() {
   useEffect(() => {
     if (typeof window === "undefined") return;
 
-    window.history.scrollRestoration = "manual";
+    try {
+      if (window.history && "scrollRestoration" in window.history) {
+        window.history.scrollRestoration = "manual";
+      }
+    } catch {}
+
     ensureHistoryPatched();
     currentKeyRef.current = locationKey();
 

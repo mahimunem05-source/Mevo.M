@@ -11,10 +11,16 @@ export const MobileInstallBanner = memo(function MobileInstallBanner() {
     if (typeof window === "undefined") return;
 
     // 1. Check if already installed as standalone PWA
-    const isStandalone =
-      window.matchMedia("(display-mode: standalone)").matches ||
-      Boolean((navigator as unknown as { standalone?: boolean }).standalone) ||
-      document.referrer.includes("android-app://");
+    let isStandalone = false;
+    try {
+      isStandalone = Boolean(
+        (window.matchMedia && window.matchMedia("(display-mode: standalone)")?.matches) ||
+        (navigator as unknown as { standalone?: boolean })?.standalone ||
+        (typeof document !== "undefined" && typeof document.referrer === "string" && document.referrer.includes("android-app://"))
+      );
+    } catch {
+      isStandalone = false;
+    }
 
     if (isStandalone) {
       setIsVisible(false);
@@ -28,15 +34,22 @@ export const MobileInstallBanner = memo(function MobileInstallBanner() {
         return;
       }
     } catch {
-      // Storage unavailable
+      // Storage unavailable in private browsing
     }
 
     // 3. Detect mobile device
-    const userAgent =
-      navigator.userAgent || navigator.vendor || (window as unknown as { opera?: string }).opera || "";
-    const isMobileDevice =
-      /android|iphone|ipad|ipod|blackberry|iemobile|opera mini/i.test(userAgent) ||
-      (window.innerWidth < 768 && "ontouchstart" in window);
+    let isMobileDevice = false;
+    try {
+      const userAgent =
+        (typeof navigator !== "undefined" && (navigator.userAgent || navigator.vendor)) ||
+        (typeof window !== "undefined" && (window as unknown as { opera?: string }).opera) ||
+        "";
+      isMobileDevice =
+        /android|iphone|ipad|ipod|blackberry|iemobile|opera mini/i.test(userAgent) ||
+        (typeof window !== "undefined" && window.innerWidth < 768 && "ontouchstart" in window);
+    } catch {
+      isMobileDevice = false;
+    }
 
     if (!isMobileDevice) {
       setIsVisible(false);

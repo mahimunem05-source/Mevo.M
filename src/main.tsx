@@ -2,6 +2,7 @@ import React from "react";
 import ReactDOM from "react-dom/client";
 import { RouterProvider } from "@tanstack/react-router";
 import { getRouter } from "./router";
+import { RootErrorBoundary } from "@/components/music/root-error-boundary";
 import "./styles.css";
 
 const router = getRouter();
@@ -11,21 +12,37 @@ if (rootElement && !rootElement.innerHTML) {
   const root = ReactDOM.createRoot(rootElement);
   root.render(
     <React.StrictMode>
-      <RouterProvider router={router} />
+      <RootErrorBoundary>
+        <RouterProvider router={router} />
+      </RootErrorBoundary>
     </React.StrictMode>,
   );
 }
 
-// Register PWA Service Worker for fullscreen installation
+// Resilient PWA Service Worker Registration
 if (typeof window !== "undefined" && "serviceWorker" in navigator) {
-  window.addEventListener("load", () => {
-    navigator.serviceWorker
-      .register("/sw.js")
-      .then((reg) => {
-        // Successfully registered
-      })
-      .catch((error) => {
-        console.warn("PWA Service Worker registration bypassed:", error);
-      });
-  });
+  const registerSW = () => {
+    try {
+      navigator.serviceWorker
+        .register("/sw.js", { scope: "/" })
+        .then((reg) => {
+          // Check for worker updates in background
+          if (reg && typeof reg.update === "function") {
+            reg.update().catch(() => {});
+          }
+        })
+        .catch((error) => {
+          console.warn("[MEVO] Service Worker registration bypassed:", error);
+        });
+    } catch (err) {
+      console.warn("[MEVO] Service Worker registration failed silently:", err);
+    }
+  };
+
+  if (document.readyState === "complete") {
+    registerSW();
+  } else {
+    window.addEventListener("load", registerSW, { once: true });
+  }
 }
+

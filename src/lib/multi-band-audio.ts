@@ -133,39 +133,45 @@ function getEnergy(data: Uint8Array): number {
  */
 export function getLiveMultiBandLevels(
   isPlaying: boolean,
-  timeMs: number = performance.now(),
+  timeMs: number = typeof performance !== "undefined" && typeof performance.now === "function"
+    ? performance.now()
+    : Date.now(),
 ): { bass: number; vocal: number; treble: number; isRealAudio: boolean } {
   let bass = 0;
   let vocal = 0;
   let treble = 0;
   let isRealAudio = false;
 
-  if (
-    engine.ctx &&
-    engine.ctx.state === "running" &&
-    engine.bassAnalyser &&
-    engine.vocalAnalyser &&
-    engine.trebleAnalyser &&
-    engine.bassData &&
-    engine.vocalData &&
-    engine.trebleData
-  ) {
-    // Read raw Web Audio FFT byte frequencies
-    engine.bassAnalyser.getByteFrequencyData(engine.bassData as any);
-    engine.vocalAnalyser.getByteFrequencyData(engine.vocalData as any);
-    engine.trebleAnalyser.getByteFrequencyData(engine.trebleData as any);
+  try {
+    if (
+      engine.ctx &&
+      engine.ctx.state === "running" &&
+      engine.bassAnalyser &&
+      engine.vocalAnalyser &&
+      engine.trebleAnalyser &&
+      engine.bassData &&
+      engine.vocalData &&
+      engine.trebleData
+    ) {
+      // Read raw Web Audio FFT byte frequencies
+      engine.bassAnalyser.getByteFrequencyData(engine.bassData as any);
+      engine.vocalAnalyser.getByteFrequencyData(engine.vocalData as any);
+      engine.trebleAnalyser.getByteFrequencyData(engine.trebleData as any);
 
-    const bassEnergy = getEnergy(engine.bassData);
-    const vocalEnergy = getEnergy(engine.vocalData);
-    const trebleEnergy = getEnergy(engine.trebleData);
+      const bassEnergy = getEnergy(engine.bassData);
+      const vocalEnergy = getEnergy(engine.vocalData);
+      const trebleEnergy = getEnergy(engine.trebleData);
 
-    if (bassEnergy > 0.01 || vocalEnergy > 0.01 || trebleEnergy > 0.01) {
-      // Dynamic non-linear power curve for punchy bass & crisp treble
-      bass = Math.min(1.0, Math.pow(bassEnergy * 1.5, 1.25));
-      vocal = Math.min(1.0, Math.pow(vocalEnergy * 1.35, 1.1));
-      treble = Math.min(1.0, Math.pow(trebleEnergy * 1.7, 1.3));
-      isRealAudio = true;
+      if (bassEnergy > 0.01 || vocalEnergy > 0.01 || trebleEnergy > 0.01) {
+        // Dynamic non-linear power curve for punchy bass & crisp treble
+        bass = Math.min(1.0, Math.pow(bassEnergy * 1.5, 1.25));
+        vocal = Math.min(1.0, Math.pow(vocalEnergy * 1.35, 1.1));
+        treble = Math.min(1.0, Math.pow(trebleEnergy * 1.7, 1.3));
+        isRealAudio = true;
+      }
     }
+  } catch (err) {
+    // Non-blocking Web Audio read failure
   }
 
   // Fallback intelligent simulation envelope if context is inactive or silent
@@ -190,3 +196,4 @@ export function getLiveMultiBandLevels(
 
   return { bass, vocal, treble, isRealAudio };
 }
+
