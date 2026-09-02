@@ -15,6 +15,7 @@ import { PlayerProvider } from "@/lib/player-context";
 import { SettingsProvider } from "@/context/SettingsContext";
 import { NavigationHistoryProvider } from "@/lib/navigation-history";
 import { Navbar } from "@/components/music/navbar";
+import { MobileInstallBanner } from "@/components/music/mobile-install-banner";
 import { AmbientBackground } from "@/components/music/ambient-background";
 import { BottomPlayer } from "@/components/music/bottom-player";
 import { KeyboardShortcuts } from "@/components/music/keyboard-shortcuts";
@@ -123,6 +124,9 @@ function RootComponent() {
           <PlayerProvider>
             <AmbientBackground />
             <KeyboardShortcuts />
+
+            {/* Mobile PWA Top Download & Install Banner */}
+            {!isSongPage && <MobileInstallBanner />}
 
             {/* MEVO Navigation Header (Logo + Search + Menu) on all non-song pages */}
             {!isSongPage && <Navbar />}

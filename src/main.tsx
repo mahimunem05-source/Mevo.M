@@ -15,3 +15,17 @@ if (rootElement && !rootElement.innerHTML) {
     </React.StrictMode>,
   );
 }
+
+// Register PWA Service Worker for fullscreen installation
+if (typeof window !== "undefined" && "serviceWorker" in navigator) {
+  window.addEventListener("load", () => {
+    navigator.serviceWorker
+      .register("/sw.js")
+      .then((reg) => {
+        // Successfully registered
+      })
+      .catch((error) => {
+        console.warn("PWA Service Worker registration bypassed:", error);
+      });
+  });
+}
