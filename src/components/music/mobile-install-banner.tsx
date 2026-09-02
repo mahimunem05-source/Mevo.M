@@ -1,20 +1,11 @@
 import { useEffect, useState, useCallback, memo } from "react";
 import { AnimatePresence, motion } from "motion/react";
-import { Download, X, Sparkles, Share, PlusSquare } from "lucide-react";
-import { cn } from "@/lib/utils";
-
-interface BeforeInstallPromptEvent extends Event {
-  prompt: () => Promise<void>;
-  userChoice: Promise<{ outcome: "accepted" | "dismissed"; platform: string }>;
-}
+import { Download, X, Sparkles } from "lucide-react";
 
 const DISMISS_STORAGE_KEY = "mevo-install-banner-dismissed";
 
 export const MobileInstallBanner = memo(function MobileInstallBanner() {
-  const [deferredPrompt, setDeferredPrompt] = useState<BeforeInstallPromptEvent | null>(null);
   const [isVisible, setIsVisible] = useState(false);
-  const [showIosGuide, setShowIosGuide] = useState(false);
-  const [isIos, setIsIos] = useState(false);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -41,13 +32,11 @@ export const MobileInstallBanner = memo(function MobileInstallBanner() {
     }
 
     // 3. Detect mobile device
-    const userAgent = navigator.userAgent || navigator.vendor || (window as unknown as { opera?: string }).opera || "";
+    const userAgent =
+      navigator.userAgent || navigator.vendor || (window as unknown as { opera?: string }).opera || "";
     const isMobileDevice =
       /android|iphone|ipad|ipod|blackberry|iemobile|opera mini/i.test(userAgent) ||
       (window.innerWidth < 768 && "ontouchstart" in window);
-
-    const isIosDevice = /iphone|ipad|ipod/i.test(userAgent) && !(window as unknown as { MSStream?: unknown }).MSStream;
-    setIsIos(isIosDevice);
 
     if (!isMobileDevice) {
       setIsVisible(false);
@@ -56,58 +45,16 @@ export const MobileInstallBanner = memo(function MobileInstallBanner() {
 
     // On mobile devices, show banner
     setIsVisible(true);
-
-    // 4. Capture native 'beforeinstallprompt' event (Chromium, Android, Edge, Chrome)
-    const handleBeforeInstallPrompt = (e: Event) => {
-      e.preventDefault();
-      setDeferredPrompt(e as BeforeInstallPromptEvent);
-      setIsVisible(true);
-    };
-
-    const handleAppInstalled = () => {
-      setIsVisible(false);
-      setDeferredPrompt(null);
-    };
-
-    window.addEventListener("beforeinstallprompt", handleBeforeInstallPrompt);
-    window.addEventListener("appinstalled", handleAppInstalled);
-
-    return () => {
-      window.removeEventListener("beforeinstallprompt", handleBeforeInstallPrompt);
-      window.removeEventListener("appinstalled", handleAppInstalled);
-    };
   }, []);
 
   const handleDismiss = useCallback(() => {
     setIsVisible(false);
-    setShowIosGuide(false);
     try {
       sessionStorage.setItem(DISMISS_STORAGE_KEY, "1");
     } catch {
       // Ignore storage errors
     }
   }, []);
-
-  const handleInstallClick = async () => {
-    if (deferredPrompt) {
-      try {
-        await deferredPrompt.prompt();
-        const choice = await deferredPrompt.userChoice;
-        if (choice.outcome === "accepted") {
-          setIsVisible(false);
-        }
-        setDeferredPrompt(null);
-      } catch (err) {
-        console.warn("Native PWA prompt error:", err);
-      }
-    } else if (isIos) {
-      // Show elegant iOS Add-to-Home-Screen instructions
-      setShowIosGuide((prev) => !prev);
-    } else {
-      // Fallback: notify how to add on generic mobile browsers
-      setShowIosGuide((prev) => !prev);
-    }
-  };
 
   return (
     <AnimatePresence>
@@ -157,15 +104,15 @@ export const MobileInstallBanner = memo(function MobileInstallBanner() {
 
             {/* Actions: Install CTA + Close button */}
             <div className="flex items-center gap-1.5 shrink-0">
-              <motion.button
-                type="button"
+              <motion.a
+                href="/mevo.apk"
+                download="MEVO.apk"
                 whileTap={{ scale: 0.94 }}
-                onClick={handleInstallClick}
-                className="flex items-center gap-1.5 rounded-full bg-gradient-to-r from-[#4FD1C5] to-[#38B2AC] px-3.5 py-1.5 text-xs font-bold text-[#071012] shadow-[0_2px_10px_rgba(79,209,197,0.35)] transition-all hover:brightness-110 active:brightness-95 cursor-pointer"
+                className="flex items-center gap-1.5 rounded-full bg-gradient-to-r from-[#4FD1C5] to-[#38B2AC] px-3.5 py-1.5 text-xs font-bold text-[#071012] shadow-[0_2px_10px_rgba(79,209,197,0.35)] transition-all hover:brightness-110 active:brightness-95 cursor-pointer no-underline select-none"
               >
                 <Download className="size-3.5 stroke-[2.5]" />
                 <span>Install</span>
-              </motion.button>
+              </motion.a>
 
               <button
                 type="button"
@@ -177,53 +124,6 @@ export const MobileInstallBanner = memo(function MobileInstallBanner() {
               </button>
             </div>
           </div>
-
-          {/* iOS / Generic Fallback Installation Micro-Guide */}
-          <AnimatePresence>
-            {showIosGuide && (
-              <motion.div
-                initial={{ height: 0, opacity: 0 }}
-                animate={{ height: "auto", opacity: 1 }}
-                exit={{ height: 0, opacity: 0 }}
-                transition={{ duration: 0.25, ease: "easeOut" }}
-                className="overflow-hidden border-t border-white/10 bg-[#0B1519] px-4 py-2.5 text-[11px] text-white/80"
-              >
-                <div className="flex items-start gap-2">
-                  <div className="mt-0.5 grid size-5 shrink-0 place-items-center rounded-md bg-[#4FD1C5]/20 text-[#4FD1C5]">
-                    {isIos ? <Share className="size-3" /> : <PlusSquare className="size-3" />}
-                  </div>
-                  <div className="flex-1 space-y-0.5">
-                    <p className="font-bold text-white">To install on your home screen:</p>
-                    <p className="text-white/70">
-                      {isIos ? (
-                        <>
-                          Tap <span className="font-semibold text-[#4FD1C5]">Share</span> (at the
-                          bottom of Safari), then tap{" "}
-                          <span className="font-semibold text-[#4FD1C5]">
-                            &ldquo;Add to Home Screen&rdquo;
-                          </span>
-                          .
-                        </>
-                      ) : (
-                        <>
-                          Tap your browser&rsquo;s <span className="font-semibold text-[#4FD1C5]">menu (⋮)</span>{" "}
-                          and choose <span className="font-semibold text-[#4FD1C5]">&ldquo;Install app&rdquo;</span> or{" "}
-                          <span className="font-semibold text-[#4FD1C5]">&ldquo;Add to Home screen&rdquo;</span>.
-                        </>
-                      )}
-                    </p>
-                  </div>
-                  <button
-                    type="button"
-                    onClick={() => setShowIosGuide(false)}
-                    className="text-white/40 hover:text-white text-[10px] uppercase font-bold"
-                  >
-                    Got it
-                  </button>
-                </div>
-              </motion.div>
-            )}
-          </AnimatePresence>
         </motion.div>
       )}
     </AnimatePresence>
